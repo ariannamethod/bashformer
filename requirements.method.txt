@@ -1,0 +1,2 @@
+# Optional Phase-II field physics. Vanilla Bashformer does not need this.
+ariannamethod git https://github.com/ariannamethod/ariannamethod.ai.git ded407ca750c4967527f42e3b808994cdf583881

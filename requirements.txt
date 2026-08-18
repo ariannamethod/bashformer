@@ -1,0 +1,3 @@
+# Bashformer build requirements.
+# name        kind  source                                           ref
+notorch       git   https://github.com/ariannamethod/notorch.git      a30329b8111e69926ea41e5ec4987ae7f0c18afc
