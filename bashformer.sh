@@ -5,7 +5,7 @@
 set -u
 LC_ALL=C
 export LC_ALL
-BF_VERSION=0.4.0
+BF_VERSION=0.5.0
 
 bf_die() {
     printf 'bashformer: %s\n' "$*" >&2
@@ -34,7 +34,12 @@ bf_usage() {
         '  --debt X             prophecy debt, 0..100 (default: soma or 0)' \
         '  --debt-decay X       per-emitted-token debt decay, 0..1 (default: 0.998)' \
         '  --hebbian            enable live co-occurrence H-term memory' \
-        '  --soma FILE          load/save persistent field state (BFSOMA2; reads v1)' \
+        '  --plasticity MODE    flat or debt-gated Hebbian learning (default: flat)' \
+        '  --spa                enable Sentence Phonon Attention' \
+        '  --spa-alpha X        sentence recency decay, 0..1 (default: 0.85)' \
+        '  --spa-strength X     connectedness sharpening, 0..1 (default: 0.30)' \
+        '  --spa-history N      retained sentence embeddings, 1..8 (default: 8)' \
+        '  --soma FILE          load/save persistent field state (BFSOMA3; reads v1/v2)' \
         '  --learn on|off       permit persistent memory/dynamics mutation (default: on)' \
         '  --next-id            print only the next token id' \
         '  --next-hex           print only the next token byte in hex' \
@@ -525,7 +530,7 @@ BF_STATE_MUTABLE=1
 BF_BASE_TEMP_Q=0
 BF_RNG_STATE=1
 
-# Stateful Method memory/dynamics (v0.4). Co-occurrence counts are QSHIFT fixed-point.
+# Stateful Method memory/dynamics (v0.5). Co-occurrence counts are QSHIFT fixed-point.
 declare -A BF_COOC=()
 declare -a BF_COOC_RING=()
 BF_HEBBIAN_ENABLED=0
@@ -536,9 +541,38 @@ BF_COOC_CTX=8
 BF_COOC_WINDOW=5
 BF_COOC_CAP=0
 
+# Debt-gated plasticity. `flat` preserves the v0.3/v0.4 learning law; `debt`
+# raises the per-token Hebbian update from 1x toward 2x as prophecy debt grows.
+BF_PLASTICITY_MODE=flat
+BF_PLASTICITY_UPDATES=0
+BF_PLASTICITY_LAST_GAIN_Q=0
+
+# Sentence Phonon Attention (SPA). History contains flattened QSHIFT sentence
+# embeddings; current contains token ids for the unfinished sentence.
+BF_SPA_ENABLED=0
+BF_SPA_ALPHA_Q=0
+BF_SPA_STRENGTH_Q=0
+BF_SPA_HISTORY_MAX=8
+BF_SPA_HISTORY_N=0
+BF_SPA_SENTENCES=0
+BF_SPA_LAST_CONN_Q=0
+BF_SPA_LAST_TEMP_Q=0
+BF_SPA_PENDING_BOUNDARY=0
+BF_SPA_SCALE_Q=0
+declare -a BF_SPA_HISTORY=()
+declare -a BF_SPA_CURRENT=()
+
 bf_qmul() {
     local a=$1 b=$2
     bf_qshift "$((a * b))"
+}
+
+bf_div_round() {
+    local num=$1 den=$2
+    (( den > 0 )) || { REPLY=0; return 1; }
+    if (( num >= 0 )); then REPLY=$(((num + den/2) / den))
+    else REPLY=$(( - (((-num) + den/2) / den) ))
+    fi
 }
 
 bf_method_defaults() {
@@ -557,6 +591,29 @@ bf_method_defaults() {
     BF_METHOD_ENTROPY_FLOOR_Q=$REPLY
     bf_decimal_to_q '0.95' || bf_die 'internal resonance-ceiling default'
     BF_METHOD_RESONANCE_CEILING_Q=$REPLY
+
+    BF_PLASTICITY_MODE=flat
+    BF_PLASTICITY_UPDATES=0
+    BF_PLASTICITY_LAST_GAIN_Q=$QS
+    bf_decimal_to_q '0.85' || bf_die 'internal SPA alpha default'
+    BF_SPA_ALPHA_Q=$REPLY
+    bf_decimal_to_q '0.30' || bf_die 'internal SPA strength default'
+    BF_SPA_STRENGTH_Q=$REPLY
+    BF_SPA_HISTORY_MAX=8
+    BF_SPA_HISTORY_N=0
+    BF_SPA_SENTENCES=0
+    BF_SPA_LAST_CONN_Q=0
+    BF_SPA_LAST_TEMP_Q=$QS
+    BF_SPA_PENDING_BOUNDARY=0
+    BF_SPA_HISTORY=()
+    BF_SPA_CURRENT=()
+
+    # QSHIFT approximation of 1/sqrt(DIM), computed with the same integer
+    # Newton primitive used by RMSNorm. sqrt(D)*Q is the denominator.
+    bf_isqrt "$((DIM * QS * QS))"
+    local spa_root=$REPLY
+    (( spa_root > 0 )) || spa_root=1
+    BF_SPA_SCALE_Q=$(((QS * QS + spa_root/2) / spa_root))
 }
 
 bf_effective_temp_q() {
@@ -583,6 +640,132 @@ bf_hebbian_clear() {
     BF_COOC_CAP=$((1000000 * QS))
 }
 
+bf_plasticity_gain_q() {
+    if [[ $BF_PLASTICITY_MODE == debt ]]; then
+        local denom=$((BF_METHOD_DEBT_Q + 5 * QS))
+        if (( denom > 0 )); then
+            REPLY=$((QS + (BF_METHOD_DEBT_Q * QS + denom/2) / denom))
+        else
+            REPLY=$QS
+        fi
+    else
+        REPLY=$QS
+    fi
+}
+
+bf_spa_is_boundary() {
+    local token=$1 hx
+    hx=${BF_ID_TO_HEX[token]:-}
+    case $hx in 0a|21|2e|3f) return 0 ;; *) return 1 ;; esac
+}
+
+bf_spa_observe_token() {
+    local token=$1
+    (( BF_FIELD_ENABLED && BF_SPA_ENABLED )) || return 0
+    (( token >= 0 && token < VOCAB )) || token=$UNK_ID
+    BF_SPA_CURRENT+=("$token")
+    (( ${#BF_SPA_CURRENT[@]} <= CTX )) || BF_SPA_CURRENT=("${BF_SPA_CURRENT[@]:1}")
+    if bf_spa_is_boundary "$token"; then BF_SPA_PENDING_BOUNDARY=1
+    else BF_SPA_PENDING_BOUNDARY=0
+    fi
+}
+
+# Exponentially weighted mean of token embeddings. The newest token has weight
+# 1.0 and each older token is multiplied by SPA_ALPHA. All arithmetic is QSHIFT.
+bf_spa_sentence_embedding() {
+    local out_name=$1 n=${#BF_SPA_CURRENT[@]} i d token base weight=$QS sumw=0
+    local -n out=$out_name
+    out=()
+    for ((d=0; d<DIM; d++)); do out[d]=0; done
+    (( n > 0 )) || { unset -n out; return 1; }
+    for ((i=n-1; i>=0; i--)); do
+        token=${BF_SPA_CURRENT[i]}; base=$((token * DIM))
+        for ((d=0; d<DIM; d++)); do (( out[d] += WTE[base+d] * weight )); done
+        (( sumw += weight ))
+        bf_qmul "$weight" "$BF_SPA_ALPHA_Q"; weight=$REPLY
+    done
+    (( sumw > 0 )) || sumw=1
+    for ((d=0; d<DIM; d++)); do
+        bf_div_round "${out[d]}" "$sumw"; out[d]=$REPLY
+    done
+    unset -n out
+}
+
+bf_spa_connectedness() {
+    BF_SPA_LAST_CONN_Q=0
+    BF_SPA_LAST_TEMP_Q=$QS
+    (( BF_FIELD_ENABLED && BF_SPA_ENABLED && BF_SPA_HISTORY_N > 0 && ${#BF_SPA_CURRENT[@]} > 0 )) || {
+        REPLY=0; return 0;
+    }
+    local -a query=() scores=() exps=()
+    bf_spa_sentence_embedding query || { REPLY=0; return 0; }
+    local s d off dot scaled score max=-9223372036854775807 diff idx e sumexp=0 maxexp=0
+    local half2=$((1 << (2 * QSHIFT - 1)))
+    for ((s=0; s<BF_SPA_HISTORY_N; s++)); do
+        off=$((s * DIM)); dot=0
+        for ((d=0; d<DIM; d++)); do (( dot += query[d] * BF_SPA_HISTORY[off+d] )); done
+        scaled=$((dot * BF_SPA_SCALE_Q))
+        if (( scaled >= 0 )); then score=$(((scaled + half2) >> (2 * QSHIFT)))
+        else score=$(( - (((-scaled) + half2) >> (2 * QSHIFT)) ))
+        fi
+        scores[s]=$score
+        (( score > max )) && max=$score
+    done
+    for ((s=0; s<BF_SPA_HISTORY_N; s++)); do
+        diff=$((max - scores[s]))
+        idx=$(((diff * LUT_STEPS + QHALF) >> QSHIFT))
+        (( idx < 0 )) && idx=0
+        (( idx > EXP_MAX_INDEX )) && idx=$EXP_MAX_INDEX
+        e=${EXP_NEG[idx]}; exps[s]=$e; (( sumexp += e )); (( e > maxexp )) && maxexp=$e
+    done
+    (( sumexp > 0 )) || { REPLY=0; return 0; }
+    REPLY=$(((maxexp * QS + sumexp/2) / sumexp))
+    (( REPLY < 0 )) && REPLY=0
+    (( REPLY > QS )) && REPLY=$QS
+    BF_SPA_LAST_CONN_Q=$REPLY
+}
+
+# SPA lowers an effective logit temperature by connectedness. This is the
+# fixed-point equivalent of logits /= (1 - strength * connectedness).
+bf_apply_spa_to_logits() {
+    (( BF_FIELD_ENABLED && BF_SPA_ENABLED )) || return 0
+    local conn temp_q i product milli_q
+    bf_spa_connectedness; conn=$REPLY
+    if (( conn > 0 && BF_SPA_STRENGTH_Q > 0 )); then
+        bf_qmul "$BF_SPA_STRENGTH_Q" "$conn"; temp_q=$((QS - REPLY))
+        milli_q=$(((QS + 500) / 1000)); (( milli_q < 1 )) && milli_q=1
+        (( temp_q < milli_q )) && temp_q=$milli_q
+        BF_SPA_LAST_TEMP_Q=$temp_q
+        for ((i=0; i<VOCAB; i++)); do
+            product=$((BF_LOGITS[i] * QS))
+            bf_div_round "$product" "$temp_q"; BF_LOGITS[i]=$REPLY
+        done
+    fi
+    if (( BF_TRACE )); then
+        printf 'TRACE spa conn=%d temp=%d current=%d history=%d sentences=%d alpha=%d strength=%d\n' \
+            "$BF_SPA_LAST_CONN_Q" "$BF_SPA_LAST_TEMP_Q" "${#BF_SPA_CURRENT[@]}" \
+            "$BF_SPA_HISTORY_N" "$BF_SPA_SENTENCES" "$BF_SPA_ALPHA_Q" "$BF_SPA_STRENGTH_Q" >&2
+    fi
+}
+
+bf_spa_commit_if_boundary() {
+    (( BF_FIELD_ENABLED && BF_SPA_ENABLED && BF_SPA_PENDING_BOUNDARY )) || return 0
+    local -a emb=()
+    if (( BF_STATE_MUTABLE )) && bf_spa_sentence_embedding emb; then
+        local d drop
+        if (( BF_SPA_HISTORY_N >= BF_SPA_HISTORY_MAX )); then
+            drop=$DIM
+            BF_SPA_HISTORY=("${BF_SPA_HISTORY[@]:drop}")
+            ((BF_SPA_HISTORY_N--))
+        fi
+        for ((d=0; d<DIM; d++)); do BF_SPA_HISTORY+=("${emb[d]}"); done
+        ((BF_SPA_HISTORY_N++))
+        ((BF_SPA_SENTENCES++))
+    fi
+    BF_SPA_CURRENT=()
+    BF_SPA_PENDING_BOUNDARY=0
+}
+
 bf_hebbian_update_edge() {
     local src=$1 dst=$2 delta=$3 key="$1,$2" value
     (( src >= 0 && src < VOCAB && dst >= 0 && dst < VOCAB && delta > 0 )) || return 0
@@ -594,19 +777,26 @@ bf_hebbian_update_edge() {
 # Incremental equivalent of am_ingest_tokens for a stream: each new token forms
 # symmetric, distance-weighted edges with the previous five tokens exactly once.
 bf_hebbian_ingest_token() {
-    local token=$1 n d prev delta
+    local token=$1 n d prev delta base_delta gain
     (( BF_FIELD_ENABLED && BF_HEBBIAN_ENABLED && BF_HEBBIAN_LEARN )) || return 0
+    bf_plasticity_gain_q; gain=$REPLY; BF_PLASTICITY_LAST_GAIN_Q=$gain
     n=${#BF_COOC_RING[@]}
     for ((d=1; d<=BF_COOC_WINDOW && d<=n; d++)); do
         prev=${BF_COOC_RING[n-d]}
-        delta=$(((QS + d/2) / d))
+        base_delta=$(((QS + d/2) / d))
+        bf_qmul "$base_delta" "$gain"; delta=$REPLY
         bf_hebbian_update_edge "$token" "$prev" "$delta"
         bf_hebbian_update_edge "$prev" "$token" "$delta"
     done
     ((BF_COOC_TOTAL++))
+    [[ $BF_PLASTICITY_MODE != debt ]] || ((BF_PLASTICITY_UPDATES++))
     BF_COOC_RING+=("$token")
     if (( ${#BF_COOC_RING[@]} > BF_COOC_CTX )); then
         BF_COOC_RING=("${BF_COOC_RING[@]:1}")
+    fi
+    if (( BF_TRACE )) && [[ $BF_PLASTICITY_MODE == debt ]]; then
+        printf 'TRACE plasticity token=%d debt=%d gain=%d updates=%d\n' \
+            "$token" "$BF_METHOD_DEBT_Q" "$gain" "$BF_PLASTICITY_UPDATES" >&2
     fi
 }
 
@@ -638,20 +828,25 @@ bf_apply_hebbian_to_logits() {
 
 bf_soma_load() {
     local file=$1 line tag a b c extra version=0
-    local seen_meta_vocab=0 seen_meta_q=0 seen_meta_total=0 seen_ring=0 seen_end=0
+    local seen_meta_vocab=0 seen_meta_q=0 seen_meta_total=0 seen_ring=0 seen_current=0 seen_end=0
     local seen_debt=0 seen_decay=0 seen_floor=0 seen_ceiling=0
     local seen_velocity=0 seen_steps=0 seen_recoveries=0
+    local seen_plasticity=0 seen_plasticity_updates=0 seen_plasticity_gain=0
+    local seen_spa_enabled=0 seen_spa_alpha=0 seen_spa_strength=0 seen_spa_conn=0 seen_spa_temp=0
+    local seen_spa_history_max=0 seen_spa_history_n=0 seen_spa_sentences=0
+    local expected_spa_n=0 spa_records=0
     [[ -e $file ]] || return 0
     [[ -r $file ]] || bf_die "cannot read soma: $file"
     BF_COOC=(); BF_COOC_RING=(); BF_COOC_TOTAL=0
+    BF_SPA_HISTORY=(); BF_SPA_CURRENT=(); BF_SPA_HISTORY_N=0; BF_SPA_PENDING_BOUNDARY=0
     while IFS= read -r line || [[ -n $line ]]; do
         [[ -z $line || ${line:0:1} == '#' ]] && continue
         (( seen_end == 0 )) || bf_die 'data after soma end marker'
         read -r tag a b c extra <<< "$line"
         case $tag in
-            BFSOMA1|BFSOMA2)
+            BFSOMA1|BFSOMA2|BFSOMA3)
                 [[ $line == "$tag" && $version == 0 ]] || bf_die 'malformed/duplicate soma header'
-                [[ $tag == BFSOMA1 ]] && version=1 || version=2
+                case $tag in BFSOMA1) version=1 ;; BFSOMA2) version=2 ;; BFSOMA3) version=3 ;; esac
                 ;;
             M)
                 (( version > 0 )) || bf_die 'soma metadata before header'
@@ -667,50 +862,110 @@ bf_soma_load() {
                         (( REPLY == QSHIFT )) || bf_die 'soma QSHIFT mismatch'; seen_meta_q=1 ;;
                     COOC_TOTAL)
                         (( seen_meta_total == 0 )) || bf_die 'duplicate soma COOC_TOTAL'
-                        bf_parse_int "$b" || bf_die 'bad soma COOC_TOTAL'
-                        (( REPLY >= 0 )) || bf_die 'negative soma COOC_TOTAL'
+                        bf_parse_nonnegative_i64 "$b" || bf_die 'bad soma COOC_TOTAL'
                         BF_COOC_TOTAL=$REPLY; seen_meta_total=1 ;;
                     DEBT_Q)
                         (( seen_debt == 0 )) || bf_die 'duplicate soma DEBT_Q'
-                        (( version == 2 )) || bf_die 'BFSOMA1 cannot contain DEBT_Q'
+                        (( version >= 2 )) || bf_die 'BFSOMA1 cannot contain DEBT_Q'
                         bf_parse_int "$b" || bf_die 'bad soma DEBT_Q'
                         (( REPLY >= 0 && REPLY <= BF_METHOD_DEBT_CAP_Q )) || bf_die 'soma DEBT_Q outside safe range'
                         BF_METHOD_DEBT_Q=$REPLY; seen_debt=1 ;;
                     DEBT_DECAY_Q)
                         (( seen_decay == 0 )) || bf_die 'duplicate soma DEBT_DECAY_Q'
-                        (( version == 2 )) || bf_die 'BFSOMA1 cannot contain DEBT_DECAY_Q'
+                        (( version >= 2 )) || bf_die 'BFSOMA1 cannot contain DEBT_DECAY_Q'
                         bf_parse_int "$b" || bf_die 'bad soma DEBT_DECAY_Q'
                         (( REPLY >= 0 && REPLY <= QS )) || bf_die 'soma DEBT_DECAY_Q outside 0..Q'
                         BF_METHOD_DEBT_DECAY_Q=$REPLY; seen_decay=1 ;;
                     ENTROPY_FLOOR_Q)
                         (( seen_floor == 0 )) || bf_die 'duplicate soma ENTROPY_FLOOR_Q'
-                        (( version == 2 )) || bf_die 'BFSOMA1 cannot contain ENTROPY_FLOOR_Q'
+                        (( version >= 2 )) || bf_die 'BFSOMA1 cannot contain ENTROPY_FLOOR_Q'
                         bf_parse_int "$b" || bf_die 'bad soma ENTROPY_FLOOR_Q'
                         (( REPLY >= 0 && REPLY <= QS )) || bf_die 'soma ENTROPY_FLOOR_Q outside 0..Q'
                         BF_METHOD_ENTROPY_FLOOR_Q=$REPLY; seen_floor=1 ;;
                     RESONANCE_CEILING_Q)
                         (( seen_ceiling == 0 )) || bf_die 'duplicate soma RESONANCE_CEILING_Q'
-                        (( version == 2 )) || bf_die 'BFSOMA1 cannot contain RESONANCE_CEILING_Q'
+                        (( version >= 2 )) || bf_die 'BFSOMA1 cannot contain RESONANCE_CEILING_Q'
                         bf_parse_int "$b" || bf_die 'bad soma RESONANCE_CEILING_Q'
                         (( REPLY >= 0 && REPLY <= QS )) || bf_die 'soma RESONANCE_CEILING_Q outside 0..Q'
                         BF_METHOD_RESONANCE_CEILING_Q=$REPLY; seen_ceiling=1 ;;
                     VELOCITY)
                         (( seen_velocity == 0 )) || bf_die 'duplicate soma VELOCITY'
-                        (( version == 2 )) || bf_die 'BFSOMA1 cannot contain VELOCITY'
+                        (( version >= 2 )) || bf_die 'BFSOMA1 cannot contain VELOCITY'
                         bf_velocity_q "$b" || bf_die 'bad soma VELOCITY'
                         BF_METHOD_VELOCITY=$b; BF_METHOD_VELOCITY_Q=$REPLY; seen_velocity=1 ;;
                     FIELD_STEPS)
                         (( seen_steps == 0 )) || bf_die 'duplicate soma FIELD_STEPS'
-                        (( version == 2 )) || bf_die 'BFSOMA1 cannot contain FIELD_STEPS'
-                        bf_parse_int "$b" || bf_die 'bad soma FIELD_STEPS'
-                        (( REPLY >= 0 )) || bf_die 'negative soma FIELD_STEPS'
+                        (( version >= 2 )) || bf_die 'BFSOMA1 cannot contain FIELD_STEPS'
+                        bf_parse_nonnegative_i64 "$b" || bf_die 'bad soma FIELD_STEPS'
                         BF_METHOD_FIELD_STEPS=$REPLY; seen_steps=1 ;;
                     RECOVERIES)
                         (( seen_recoveries == 0 )) || bf_die 'duplicate soma RECOVERIES'
-                        (( version == 2 )) || bf_die 'BFSOMA1 cannot contain RECOVERIES'
-                        bf_parse_int "$b" || bf_die 'bad soma RECOVERIES'
-                        (( REPLY >= 0 )) || bf_die 'negative soma RECOVERIES'
+                        (( version >= 2 )) || bf_die 'BFSOMA1 cannot contain RECOVERIES'
+                        bf_parse_nonnegative_i64 "$b" || bf_die 'bad soma RECOVERIES'
                         BF_METHOD_RECOVERIES=$REPLY; seen_recoveries=1 ;;
+                    PLASTICITY)
+                        (( seen_plasticity == 0 )) || bf_die 'duplicate soma PLASTICITY'
+                        (( version == 3 )) || bf_die 'legacy soma cannot contain PLASTICITY'
+                        case $b in flat|debt) BF_PLASTICITY_MODE=$b ;; *) bf_die 'bad soma PLASTICITY' ;; esac
+                        seen_plasticity=1 ;;
+                    PLASTICITY_UPDATES)
+                        (( seen_plasticity_updates == 0 )) || bf_die 'duplicate soma PLASTICITY_UPDATES'
+                        (( version == 3 )) || bf_die 'legacy soma cannot contain PLASTICITY_UPDATES'
+                        bf_parse_nonnegative_i64 "$b" || bf_die 'bad soma PLASTICITY_UPDATES'
+                        BF_PLASTICITY_UPDATES=$REPLY; seen_plasticity_updates=1 ;;
+                    PLASTICITY_LAST_GAIN_Q)
+                        (( seen_plasticity_gain == 0 )) || bf_die 'duplicate soma PLASTICITY_LAST_GAIN_Q'
+                        (( version == 3 )) || bf_die 'legacy soma cannot contain PLASTICITY_LAST_GAIN_Q'
+                        bf_parse_int "$b" || bf_die 'bad soma PLASTICITY_LAST_GAIN_Q'
+                        (( REPLY >= QS && REPLY <= 2 * QS )) || bf_die 'soma PLASTICITY_LAST_GAIN_Q outside Q..2Q'
+                        BF_PLASTICITY_LAST_GAIN_Q=$REPLY; seen_plasticity_gain=1 ;;
+                    SPA_ENABLED)
+                        (( seen_spa_enabled == 0 )) || bf_die 'duplicate soma SPA_ENABLED'
+                        (( version == 3 )) || bf_die 'legacy soma cannot contain SPA_ENABLED'
+                        bf_parse_int "$b" || bf_die 'bad soma SPA_ENABLED'
+                        (( REPLY == 0 || REPLY == 1 )) || bf_die 'soma SPA_ENABLED must be 0 or 1'
+                        BF_SPA_ENABLED=$REPLY; seen_spa_enabled=1 ;;
+                    SPA_ALPHA_Q)
+                        (( seen_spa_alpha == 0 )) || bf_die 'duplicate soma SPA_ALPHA_Q'
+                        (( version == 3 )) || bf_die 'legacy soma cannot contain SPA_ALPHA_Q'
+                        bf_parse_int "$b" || bf_die 'bad soma SPA_ALPHA_Q'
+                        (( REPLY >= 0 && REPLY <= QS )) || bf_die 'soma SPA_ALPHA_Q outside 0..Q'
+                        BF_SPA_ALPHA_Q=$REPLY; seen_spa_alpha=1 ;;
+                    SPA_STRENGTH_Q)
+                        (( seen_spa_strength == 0 )) || bf_die 'duplicate soma SPA_STRENGTH_Q'
+                        (( version == 3 )) || bf_die 'legacy soma cannot contain SPA_STRENGTH_Q'
+                        bf_parse_int "$b" || bf_die 'bad soma SPA_STRENGTH_Q'
+                        (( REPLY >= 0 && REPLY <= QS )) || bf_die 'soma SPA_STRENGTH_Q outside 0..Q'
+                        BF_SPA_STRENGTH_Q=$REPLY; seen_spa_strength=1 ;;
+                    SPA_HISTORY_MAX)
+                        (( seen_spa_history_max == 0 )) || bf_die 'duplicate soma SPA_HISTORY_MAX'
+                        (( version == 3 )) || bf_die 'legacy soma cannot contain SPA_HISTORY_MAX'
+                        bf_parse_int "$b" || bf_die 'bad soma SPA_HISTORY_MAX'
+                        (( REPLY >= 1 && REPLY <= 8 )) || bf_die 'soma SPA_HISTORY_MAX outside 1..8'
+                        BF_SPA_HISTORY_MAX=$REPLY; seen_spa_history_max=1 ;;
+                    SPA_HISTORY_N)
+                        (( seen_spa_history_n == 0 )) || bf_die 'duplicate soma SPA_HISTORY_N'
+                        (( version == 3 )) || bf_die 'legacy soma cannot contain SPA_HISTORY_N'
+                        bf_parse_int "$b" || bf_die 'bad soma SPA_HISTORY_N'
+                        (( REPLY >= 0 && REPLY <= 8 )) || bf_die 'soma SPA_HISTORY_N outside 0..8'
+                        expected_spa_n=$REPLY; seen_spa_history_n=1 ;;
+                    SPA_SENTENCES)
+                        (( seen_spa_sentences == 0 )) || bf_die 'duplicate soma SPA_SENTENCES'
+                        (( version == 3 )) || bf_die 'legacy soma cannot contain SPA_SENTENCES'
+                        bf_parse_nonnegative_i64 "$b" || bf_die 'bad soma SPA_SENTENCES'
+                        BF_SPA_SENTENCES=$REPLY; seen_spa_sentences=1 ;;
+                    SPA_LAST_CONN_Q)
+                        (( seen_spa_conn == 0 )) || bf_die 'duplicate soma SPA_LAST_CONN_Q'
+                        (( version == 3 )) || bf_die 'legacy soma cannot contain SPA_LAST_CONN_Q'
+                        bf_parse_int "$b" || bf_die 'bad soma SPA_LAST_CONN_Q'
+                        (( REPLY >= 0 && REPLY <= QS )) || bf_die 'soma SPA_LAST_CONN_Q outside 0..Q'
+                        BF_SPA_LAST_CONN_Q=$REPLY; seen_spa_conn=1 ;;
+                    SPA_LAST_TEMP_Q)
+                        (( seen_spa_temp == 0 )) || bf_die 'duplicate soma SPA_LAST_TEMP_Q'
+                        (( version == 3 )) || bf_die 'legacy soma cannot contain SPA_LAST_TEMP_Q'
+                        bf_parse_int "$b" || bf_die 'bad soma SPA_LAST_TEMP_Q'
+                        (( REPLY >= 1 && REPLY <= QS )) || bf_die 'soma SPA_LAST_TEMP_Q outside 1..Q'
+                        BF_SPA_LAST_TEMP_Q=$REPLY; seen_spa_temp=1 ;;
                     *) bf_die "unknown soma metadata: $a" ;;
                 esac
                 ;;
@@ -740,6 +995,37 @@ bf_soma_load() {
                 done
                 seen_ring=1
                 ;;
+            S)
+                (( version == 3 && seen_spa_history_n && seen_spa_history_max )) || bf_die 'SPA embedding before BFSOMA3 metadata'
+                local -a sparts=(); read -r -a sparts <<< "$line"
+                (( ${#sparts[@]} == DIM + 3 )) || bf_die 'bad SPA embedding width'
+                bf_parse_int "${sparts[1]}" || bf_die 'bad SPA embedding index'; local si=$REPLY
+                bf_parse_int "${sparts[2]}" || bf_die 'bad SPA embedding dimension'; local sdim=$REPLY
+                (( si == spa_records && si < expected_spa_n && sdim == DIM )) || bf_die 'bad SPA embedding index/dimension'
+                local sd sv
+                for ((sd=0; sd<DIM; sd++)); do
+                    bf_parse_int "${sparts[sd+3]}" || bf_die 'bad SPA embedding value'; sv=$REPLY
+                    (( sv >= -BF_VALUE_LIMIT && sv <= BF_VALUE_LIMIT )) || bf_die 'SPA embedding outside safe range'
+                    BF_SPA_HISTORY+=("$sv")
+                done
+                ((spa_records++))
+                ;;
+            C)
+                (( version == 3 )) || bf_die 'SPA current sentence in legacy soma'
+                (( seen_current == 0 )) || bf_die 'duplicate SPA current sentence'
+                local -a cparts=(); read -r -a cparts <<< "$line"
+                (( ${#cparts[@]} >= 2 )) || bf_die 'bad SPA current sentence'
+                bf_parse_int "${cparts[1]}" || bf_die 'bad SPA current length'; local cn=$REPLY
+                (( cn >= 0 && cn <= CTX && ${#cparts[@]} == cn + 2 )) || bf_die 'bad SPA current length'
+                BF_SPA_CURRENT=()
+                local ci cid
+                for ((ci=0; ci<cn; ci++)); do
+                    bf_parse_int "${cparts[ci+2]}" || bf_die 'bad SPA current token'; cid=$REPLY
+                    (( cid >= 0 && cid < VOCAB )) || bf_die 'SPA current token out of range'
+                    BF_SPA_CURRENT+=("$cid")
+                done
+                seen_current=1
+                ;;
             Z)
                 [[ $line == Z ]] || bf_die 'malformed soma end marker'
                 seen_end=1
@@ -749,19 +1035,30 @@ bf_soma_load() {
     done < "$file"
     (( version > 0 && seen_meta_vocab && seen_meta_q && seen_meta_total && seen_ring && seen_end )) || \
         bf_die 'incomplete soma'
-    if (( version == 2 )); then
+    if (( version >= 2 )); then
         (( seen_debt && seen_decay && seen_floor && seen_ceiling && seen_velocity && seen_steps && seen_recoveries )) || \
-            bf_die 'incomplete BFSOMA2 field state'
+            bf_die 'incomplete field state'
+    fi
+    if (( version == 3 )); then
+        (( seen_plasticity && seen_plasticity_updates && seen_plasticity_gain && seen_spa_enabled && seen_spa_alpha && \
+           seen_spa_strength && seen_spa_conn && seen_spa_temp && seen_spa_history_max && seen_spa_history_n && seen_spa_sentences && seen_current )) || \
+            bf_die 'incomplete BFSOMA3 state'
+        (( expected_spa_n <= BF_SPA_HISTORY_MAX && spa_records == expected_spa_n )) || bf_die 'SPA history count mismatch'
+        BF_SPA_HISTORY_N=$expected_spa_n
+        if (( ${#BF_SPA_CURRENT[@]} > 0 )); then
+            local last_current=$(( ${#BF_SPA_CURRENT[@]} - 1 ))
+            if bf_spa_is_boundary "${BF_SPA_CURRENT[last_current]}"; then BF_SPA_PENDING_BOUNDARY=1; fi
+        fi
     fi
     BF_METHOD_STATE_LOADED=$version
 }
 
 bf_soma_save() {
-    local file=$1 src dst key value
+    local file=$1 src dst key value s d
     [[ -n $file ]] || return 0
     (( BF_FIELD_ENABLED && BF_STATE_MUTABLE )) || return 0
     {
-        printf 'BFSOMA2\n'
+        printf 'BFSOMA3\n'
         printf 'M VOCAB %d\n' "$VOCAB"
         printf 'M QSHIFT %d\n' "$QSHIFT"
         printf 'M COOC_TOTAL %d\n' "$BF_COOC_TOTAL"
@@ -772,6 +1069,17 @@ bf_soma_save() {
         printf 'M VELOCITY %s\n' "$BF_METHOD_VELOCITY"
         printf 'M FIELD_STEPS %d\n' "$BF_METHOD_FIELD_STEPS"
         printf 'M RECOVERIES %d\n' "$BF_METHOD_RECOVERIES"
+        printf 'M PLASTICITY %s\n' "$BF_PLASTICITY_MODE"
+        printf 'M PLASTICITY_UPDATES %d\n' "$BF_PLASTICITY_UPDATES"
+        printf 'M PLASTICITY_LAST_GAIN_Q %d\n' "$BF_PLASTICITY_LAST_GAIN_Q"
+        printf 'M SPA_ENABLED %d\n' "$BF_SPA_ENABLED"
+        printf 'M SPA_ALPHA_Q %d\n' "$BF_SPA_ALPHA_Q"
+        printf 'M SPA_STRENGTH_Q %d\n' "$BF_SPA_STRENGTH_Q"
+        printf 'M SPA_HISTORY_MAX %d\n' "$BF_SPA_HISTORY_MAX"
+        printf 'M SPA_HISTORY_N %d\n' "$BF_SPA_HISTORY_N"
+        printf 'M SPA_SENTENCES %d\n' "$BF_SPA_SENTENCES"
+        printf 'M SPA_LAST_CONN_Q %d\n' "$BF_SPA_LAST_CONN_Q"
+        printf 'M SPA_LAST_TEMP_Q %d\n' "$BF_SPA_LAST_TEMP_Q"
         for ((src=0; src<VOCAB; src++)); do
             for ((dst=0; dst<VOCAB; dst++)); do
                 key="$src,$dst"; value=${BF_COOC[$key]:-0}
@@ -780,6 +1088,14 @@ bf_soma_save() {
         done
         printf 'R %d' "${#BF_COOC_RING[@]}"
         for value in "${BF_COOC_RING[@]}"; do printf ' %d' "$value"; done
+        printf '\n'
+        for ((s=0; s<BF_SPA_HISTORY_N; s++)); do
+            printf 'S %d %d' "$s" "$DIM"
+            for ((d=0; d<DIM; d++)); do printf ' %d' "${BF_SPA_HISTORY[s*DIM+d]}"; done
+            printf '\n'
+        done
+        printf 'C %d' "${#BF_SPA_CURRENT[@]}"
+        for value in "${BF_SPA_CURRENT[@]}"; do printf ' %d' "$value"; done
         printf '\nZ\n'
     } > "$file" || bf_die "cannot write soma: $file"
 }
@@ -789,8 +1105,10 @@ bf_apply_method_to_logits() {
     local i max sum mean diff product suppress prophecy_scale destiny_bias
     local factor scale deviation
 
-    # H term comes first in ariannamethod.ai's field pipeline.
+    # H term comes first; SPA then sharpens by sentence connectedness before
+    # the stateless prophecy/suffering/law operators see the distribution.
     bf_apply_hebbian_to_logits
+    bf_apply_spa_to_logits
 
     # DESTINY + PROPHECY: suppress paths by their distance from the current maximum.
     if (( BF_METHOD_DESTINY_Q > 0 )); then
@@ -997,6 +1315,7 @@ bf_decode_token() {
         bf_checksum BF_LOGITS; fsum=$REPLY
         printf 'TRACE p=%d logits=%d greedy=%d\n' "$pos" "$fsum" "$BF_LAST_NEXT" >&2
     fi
+    bf_spa_commit_if_boundary
 }
 
 bf_decimal_to_q() {
@@ -1072,8 +1391,10 @@ bf_main() {
     local tokens=32 temp='0' seed='1' next_mode='' generated_only=0
     local destiny='0' pain='0' focus='0.5' spread='0'
     local entropy_floor='' resonance_ceiling='' debt='' debt_decay=''
-    local velocity='raw' prophecy='7' soma='' learn='on'
+    local velocity='raw' prophecy='7' soma='' learn='on' plasticity='flat'
+    local spa_alpha='' spa_strength='' spa_history=''
     local velocity_set=0 floor_set=0 ceiling_set=0 debt_set=0 decay_set=0
+    local plasticity_set=0 spa_set=0 spa_alpha_set=0 spa_strength_set=0 spa_history_set=0
 
     while (( $# )); do
         case $1 in
@@ -1098,6 +1419,11 @@ bf_main() {
             --debt) (( $# >= 2 )) || bf_die '--debt needs a decimal'; debt=$2; debt_set=1; BF_FIELD_ENABLED=1; shift 2 ;;
             --debt-decay) (( $# >= 2 )) || bf_die '--debt-decay needs a decimal'; debt_decay=$2; decay_set=1; BF_FIELD_ENABLED=1; shift 2 ;;
             --hebbian) BF_HEBBIAN_ENABLED=1; BF_FIELD_ENABLED=1; shift ;;
+            --plasticity) (( $# >= 2 )) || bf_die '--plasticity needs flat or debt'; plasticity=$2; plasticity_set=1; BF_HEBBIAN_ENABLED=1; BF_FIELD_ENABLED=1; shift 2 ;;
+            --spa) BF_SPA_ENABLED=1; spa_set=1; BF_FIELD_ENABLED=1; shift ;;
+            --spa-alpha) (( $# >= 2 )) || bf_die '--spa-alpha needs a decimal'; spa_alpha=$2; spa_alpha_set=1; spa_set=1; BF_SPA_ENABLED=1; BF_FIELD_ENABLED=1; shift 2 ;;
+            --spa-strength) (( $# >= 2 )) || bf_die '--spa-strength needs a decimal'; spa_strength=$2; spa_strength_set=1; spa_set=1; BF_SPA_ENABLED=1; BF_FIELD_ENABLED=1; shift 2 ;;
+            --spa-history) (( $# >= 2 )) || bf_die '--spa-history needs an integer'; spa_history=$2; spa_history_set=1; spa_set=1; BF_SPA_ENABLED=1; BF_FIELD_ENABLED=1; shift 2 ;;
             --soma) (( $# >= 2 )) || bf_die '--soma needs a path'; soma=$2; BF_HEBBIAN_ENABLED=1; BF_FIELD_ENABLED=1; shift 2 ;;
             --learn) (( $# >= 2 )) || bf_die '--learn needs on or off'; learn=$2; shift 2 ;;
             --next-id) next_mode=id; shift ;;
@@ -1128,6 +1454,7 @@ bf_main() {
     esac
     BF_SOMA_FILE=$soma
     [[ -z $BF_SOMA_FILE ]] || bf_soma_load "$BF_SOMA_FILE"
+    (( spa_set )) && BF_SPA_ENABLED=1
 
     bf_decimal_to_q "$temp" || bf_die 'invalid --temperature'
     BF_BASE_TEMP_Q=$REPLY
@@ -1165,17 +1492,41 @@ bf_main() {
         (( REPLY >= 0 && REPLY <= QS )) || bf_die '--resonance-ceiling must be in 0..1'
         BF_METHOD_RESONANCE_CEILING_Q=$REPLY
     fi
+    if (( plasticity_set )); then
+        case $plasticity in flat|debt) BF_PLASTICITY_MODE=$plasticity ;; *) bf_die '--plasticity must be flat or debt' ;; esac
+    fi
+    if (( spa_alpha_set )); then
+        bf_decimal_to_q "$spa_alpha" || bf_die 'invalid --spa-alpha'
+        (( REPLY >= 0 && REPLY <= QS )) || bf_die '--spa-alpha must be in 0..1'
+        BF_SPA_ALPHA_Q=$REPLY
+    fi
+    if (( spa_strength_set )); then
+        bf_decimal_to_q "$spa_strength" || bf_die 'invalid --spa-strength'
+        (( REPLY >= 0 && REPLY <= QS )) || bf_die '--spa-strength must be in 0..1'
+        BF_SPA_STRENGTH_Q=$REPLY
+    fi
+    if (( spa_history_set )); then
+        bf_parse_int "$spa_history" || bf_die '--spa-history must be a canonical integer'
+        (( REPLY >= 1 && REPLY <= 8 )) || bf_die '--spa-history must be in 1..8'
+        BF_SPA_HISTORY_MAX=$REPLY
+        while (( BF_SPA_HISTORY_N > BF_SPA_HISTORY_MAX )); do
+            BF_SPA_HISTORY=("${BF_SPA_HISTORY[@]:DIM}")
+            ((BF_SPA_HISTORY_N--))
+        done
+    fi
 
     bf_rng_seed "$seed"
     if (( BF_TRACE && BF_FIELD_ENABLED )); then
         local initial_temp_q
         bf_effective_temp_q; initial_temp_q=$REPLY
-        printf 'TRACE method velocity=%s base_temp=%d temp=%d prophecy=%d destiny=%d pain=%d focus=%d spread=%d floor=%d ceiling=%d debt=%d decay=%d hebbian=%d edges=%d steps=%d recoveries=%d soma=%d\n' \
+        printf 'TRACE method velocity=%s base_temp=%d temp=%d prophecy=%d destiny=%d pain=%d focus=%d spread=%d floor=%d ceiling=%d debt=%d decay=%d hebbian=%d edges=%d plasticity=%s gain=%d updates=%d spa=%d alpha=%d strength=%d conn=%d history=%d current=%d sentences=%d steps=%d recoveries=%d soma=%d\n' \
             "$BF_METHOD_VELOCITY" "$BF_BASE_TEMP_Q" "$initial_temp_q" "$BF_METHOD_PROPHECY" \
             "$BF_METHOD_DESTINY_Q" "$BF_METHOD_PAIN_Q" "$BF_METHOD_FOCUS_Q" "$BF_METHOD_SPREAD_Q" \
             "$BF_METHOD_ENTROPY_FLOOR_Q" "$BF_METHOD_RESONANCE_CEILING_Q" "$BF_METHOD_DEBT_Q" \
-            "$BF_METHOD_DEBT_DECAY_Q" "$BF_HEBBIAN_ENABLED" "${#BF_COOC[@]}" \
-            "$BF_METHOD_FIELD_STEPS" "$BF_METHOD_RECOVERIES" "$BF_METHOD_STATE_LOADED" >&2
+            "$BF_METHOD_DEBT_DECAY_Q" "$BF_HEBBIAN_ENABLED" "${#BF_COOC[@]}" "$BF_PLASTICITY_MODE" \
+            "$BF_PLASTICITY_LAST_GAIN_Q" "$BF_PLASTICITY_UPDATES" "$BF_SPA_ENABLED" "$BF_SPA_ALPHA_Q" \
+            "$BF_SPA_STRENGTH_Q" "$BF_SPA_LAST_CONN_Q" "$BF_SPA_HISTORY_N" "${#BF_SPA_CURRENT[@]}" \
+            "$BF_SPA_SENTENCES" "$BF_METHOD_FIELD_STEPS" "$BF_METHOD_RECOVERIES" "$BF_METHOD_STATE_LOADED" >&2
     fi
 
     local -a prompt_ids=()
@@ -1188,6 +1539,8 @@ bf_main() {
         bf_die "prompt (${#prompt_ids[@]}) + generation ($needed) exceeds CTX=$CTX"
 
     for id in "${prompt_ids[@]}"; do
+        bf_spa_commit_if_boundary
+        bf_spa_observe_token "$id"
         bf_hebbian_ingest_token "$id"
         bf_decode_token "$id" "$pos"
         ((pos++))
@@ -1195,10 +1548,12 @@ bf_main() {
 
     if [[ $next_mode == id ]]; then
         printf '%d\n' "$BF_LAST_NEXT"
+        bf_spa_commit_if_boundary
         [[ -z $BF_SOMA_FILE ]] || bf_soma_save "$BF_SOMA_FILE"
         return
     elif [[ $next_mode == hex ]]; then
         printf '%s\n' "${BF_ID_TO_HEX[BF_LAST_NEXT]}"
+        bf_spa_commit_if_boundary
         [[ -z $BF_SOMA_FILE ]] || bf_soma_save "$BF_SOMA_FILE"
         return
     fi
@@ -1211,12 +1566,15 @@ bf_main() {
         bf_register_choice_debt "$id"
         bf_field_step "$id"
         bf_emit_id "$id"
+        bf_spa_commit_if_boundary
+        bf_spa_observe_token "$id"
         bf_hebbian_ingest_token "$id"
         if (( step + 1 < tokens )); then
             bf_decode_token "$id" "$pos"
             ((pos++))
         fi
     done
+    bf_spa_commit_if_boundary
     printf '\n'
     [[ -z $BF_SOMA_FILE ]] || bf_soma_save "$BF_SOMA_FILE"
 }
