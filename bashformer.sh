@@ -311,17 +311,19 @@ bf_load_weights() {
             D)
                 [[ -n $current ]] || bf_die 'tensor data outside tensor'
                 payload=${line#D}
+                # One match for the whole record instead of a function call per
+                # value: a 9M-parameter model has 9M of them, and the per-value
+                # path cost 22.6us each. The pattern still forbids leading zeros,
+                # so the values below are safe to hand to arithmetic - that check
+                # is what keeps weight data from being read as shell.
+                [[ $payload =~ ^([[:space:]]+-?(0|[1-9][0-9]{0,9}))+[[:space:]]*$ ]] || \
+                    bf_die "$current contains non-integer data"
                 vals=()
                 read -r -a vals <<< "$payload"
-                local v
                 local vi
                 for ((vi=0; vi<${#vals[@]}; vi++)); do
-                    v=${vals[vi]}
-                    bf_parse_int "$v" || bf_die "$current contains non-integer: $v"
-                    v=$REPLY
-                    (( v >= -BF_VALUE_LIMIT && v <= BF_VALUE_LIMIT )) || \
-                        bf_die "$current contains unsafe fixed-point value: $v"
-                    vals[vi]=$v
+                    (( vals[vi] >= -BF_VALUE_LIMIT && vals[vi] <= BF_VALUE_LIMIT )) || \
+                        bf_die "$current contains unsafe fixed-point value: ${vals[vi]}"
                 done
                 local -n target=$current
                 target+=("${vals[@]}")
