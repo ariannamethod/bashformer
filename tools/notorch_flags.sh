@@ -13,6 +13,12 @@ case ${1:-} in
         printf '\n'
         ;;
     backend) printf '%s\n' "${BACKEND:-unknown}" ;;
-    ref) printf '%s\n' "${NOTORCH_REF:-unknown}" ;;
+    ref)
+        if [[ -n ${NOTORCH_PINNED_REF:-} && ${NOTORCH_PINNED_REF} != "${NOTORCH_REF:-}" ]]; then
+            printf '%s (unpinned; requirements pin %s)\n' "${NOTORCH_REF:-unknown}" "$NOTORCH_PINNED_REF"
+        else
+            printf '%s\n' "${NOTORCH_REF:-unknown}"
+        fi
+        ;;
     *) printf 'usage: %s {cflags|libs|backend|ref}\n' "$0" >&2; exit 2 ;;
 esac

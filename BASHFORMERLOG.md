@@ -90,3 +90,73 @@ PATH=/definitely-empty bash ./bashformer.sh --weights weights/fixture-prod.bfw -
   `/opt/homebrew/lib/libnotorch.a`. `bootstrap.sh` ставит в `$HOME/.local` и
   пин проверяет. Решение по системной линковке — за Олегом.
 - Ни `bootstrap`, ни `train` в этом ходе не запускались.
+
+## 2026-08-20 — пин двинут на notorch main, стамп перестал врать
+
+### Решение
+
+Из трёх вариантов (оставить старый пин / двинуть пин / принимать системную
+сборку) взят второй. Третий отклонён: у бинаря в `/opt/homebrew/lib` нет
+ref-стампа, доказать происхождение нечем, а `bootstrap.sh` именно этим и
+занят. Первый консервировал bashformer на коде, отставшем от notorch на 7
+коммитов (`git rev-list --count a30329b8..HEAD`) — витрина, не ловящая
+ABI-дрейф, витриной быть перестаёт.
+
+Гейт перед сменой пина: собрать и проверить, потом двигать.
+`~/arianna/notorch` стоит на `f0e6fc4`, но этот коммит живёт только в
+`origin/claude/js-packed-matvec`; в main его нет. Пин на коммит из ветки
+сломал бы `bootstrap.sh` любому клонирующему. Поэтому цель — `f0e4f73`,
+голова `origin/main` notorch.
+
+```
+notorch-doctor: OK loss=3.420045 gqa=2:1 rope=500000 chuck=OK
+build/bashformer-train  193552 B
+```
+
+Сетевой `./bootstrap.sh` по новому пину тоже проверен: `f0e4f73`
+вычитывается с GitHub, стамп совпал.
+
+### Найденный по дороге баг честности
+
+`bootstrap.sh` собирал notorch из `f0e4f73`, а в `notorch.commit` и
+`notorch.env` записывал **заявленный** пин `a30329b8`. `make doctor`
+печатал этот ref как происхождение сборки — и врал. Причина:
+`install_notorch` писал `$ref` из `requirements.txt`, а не фактический
+HEAD источника. С `NOTORCH_ALLOW_UNPINNED=1` пин превращался в украшение.
+
+Исправлено: `bf_checkout_source` вычисляет `BF_SOURCE_REF` через
+`git rev-parse HEAD` источника (для обеих веток — и локальной, и сетевой);
+стамп и `NOTORCH_REF` несут фактический коммит, рядом появился
+`NOTORCH_PINNED_REF`, строка установки при расхождении говорит `UNPINNED`
+вслух, а `tools/notorch_flags.sh ref` дописывает
+`(unpinned; requirements pin …)`.
+
+Красная проба до фикса:
+
+```
+NOTORCH_REF=a30329b8111e69926ea41e5ec4987ae7f0c18afc   ← записано
+f0e4f73be9d58a7dac536655905c791fe015177a                ← собрано
+```
+
+После фикса:
+
+```
+installed notorch f0e4f73… UNPINNED (requirements pin a30329b8…) (accelerate) -> ~/.local
+tools/notorch_flags.sh ref → f0e4f73… (unpinned; requirements pin a30329b8…)
+```
+
+### Проба на инвариант
+
+В `tests/bootstrap.sh` добавлен блок: сборка с `NOTORCH_ALLOW_UNPINNED=1`
+из источника, чей HEAD не совпадает с пином, обязана записать в стамп
+фактический коммит, сказать `UNPINNED` в логе и показать пометку в
+`notorch_flags.sh ref`. Тест фальсифицирован: с возвращённым
+`local built=$ref` он краснеет, с фиксом — зелёный.
+
+`make test` после всех правок: 8/8, 20.8 s.
+
+### Открыто
+
+- Обученного тела по-прежнему нет; `make train` не запускался.
+- `~/arianna/notorch` остался на `f0e6fc4` — не трогался, сборка шла из
+  отдельного клона в scratchpad на `f0e4f73`.

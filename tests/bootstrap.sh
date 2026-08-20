@@ -60,6 +60,18 @@ if HOME="$TMP/home" BASHFORMER_PREFIX="$TMP/wrong-prefix" NOTORCH_SOURCE="$TMP/u
     exit 1
 fi
 
+# Opting out of the pin does not license a false stamp. What gets recorded is the
+# commit that was actually built; the requested pin is kept beside it and the
+# install line says UNPINNED out loud.
+HOME="$TMP/home" XDG_CACHE_HOME="$TMP/cache" BASHFORMER_PREFIX="$TMP/unpinned-prefix" \
+    NOTORCH_SOURCE="$TMP/upstream" NOTORCH_ALLOW_UNPINNED=1 NOTORCH_BACKEND=scalar \
+    "$ROOT/bootstrap.sh" "$TMP/wrong-requirements.txt" > "$TMP/unpinned.log"
+[[ $(<"$TMP/unpinned-prefix/share/bashformer/notorch.commit") == "$REF" ]]
+[[ $(<"$TMP/unpinned.log") == *UNPINNED* ]]
+unpinned_ref=$(HOME="$TMP/home" BASHFORMER_PREFIX="$TMP/unpinned-prefix" \
+    "$ROOT/tools/notorch_flags.sh" ref)
+[[ $unpinned_ref == "$REF (unpinned; requirements pin $(printf '%040d' 0))" ]]
+
 # On AVX2+FMA x86_64, the zero-external-library SIMD path is a first-class install backend.
 flags_line=$(grep -m1 -E '^(flags|Features)[[:space:]]*:' /proc/cpuinfo 2>/dev/null || true)
 if [[ $(uname -m) == x86_64 && " $flags_line " == *' avx2 '* && " $flags_line " == *' fma '* ]]; then

@@ -116,6 +116,10 @@ bf_checkout_source() {
     fi
     BF_SOURCE_PATH=$source_path
     BF_SOURCE_CLEANUP=$cleanup
+    # The stamp must record what was actually built, not what was requested.
+    # With NOTORCH_ALLOW_UNPINNED=1 those two differ, and a stamp that repeats
+    # the request would make `make doctor` print a provenance it cannot back.
+    BF_SOURCE_REF=$(git -C "$source_path" rev-parse HEAD 2>/dev/null) || BF_SOURCE_REF=$ref
 }
 
 install_notorch() {
@@ -164,14 +168,21 @@ install_notorch() {
     if (( cleanup )); then rm -rf -- "$src"; fi
     (( rc == 0 )) || return "$rc"
 
-    printf '%s\n' "$ref" > "$stamp"
+    local built=${BF_SOURCE_REF:-$ref}
+    printf '%s\n' "$built" > "$stamp"
     {
         printf 'PREFIX=%q\n' "$PREFIX"
         printf 'BACKEND=%q\n' "$backend"
-        printf 'NOTORCH_REF=%q\n' "$ref"
+        printf 'NOTORCH_REF=%q\n' "$built"
+        printf 'NOTORCH_PINNED_REF=%q\n' "$ref"
         printf 'BACKEND_LINK=%q\n' "$backend_link"
     } > "$env_file"
-    printf 'installed notorch %s (%s) -> %s\n' "$ref" "$backend" "$PREFIX"
+    if [[ $built == "$ref" ]]; then
+        printf 'installed notorch %s (%s) -> %s\n' "$built" "$backend" "$PREFIX"
+    else
+        printf 'installed notorch %s UNPINNED (requirements pin %s) (%s) -> %s\n' \
+            "$built" "$ref" "$backend" "$PREFIX"
+    fi
 }
 
 install_ariannamethod() {
