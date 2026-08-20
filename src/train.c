@@ -7,6 +7,7 @@
 #include "notorch.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
@@ -31,6 +32,11 @@
 #define BF_EVAL_SEQS 32
 #define BF_LOG_EVERY 100
 #define BF_CKPT_EVERY 1000
+/* The runtime contract, restated where the weights are born. bashformer.sh
+   refuses any loaded value beyond BF_VALUE_LIMIT, and refuses any activation
+   beyond the bound derived from this geometry. A forge that ignores both can
+   spend a whole run and hand back a file its own runtime will not execute. */
+#define BF_VALUE_LIMIT 67108864
 
 #ifndef NT_OP_NONE
 #define NT_OP_NONE 0
@@ -262,7 +268,44 @@ static int quantize(float x) {
     return (int)q;
 }
 
+static int64_t bf_isqrt64(int64_t n) {
+    if (n <= 0) return 0;
+    int64_t x = n, y = (x + 1) / 2;
+    while (y < x) { x = y; y = (x + n / x) / 2; }
+    return x;
+}
+
+/* Mirror of bf_activation_limit in bashformer.sh: the tightest bound over every
+   reduction the runtime performs, against 2^62 for headroom. */
+static int64_t bf_activation_limit(void) {
+    int64_t cap = (int64_t)1 << 62, qs = BF_QS;
+    int64_t cols = BF_DIM > BF_FFN ? BF_DIM : BF_FFN;
+    int64_t attn_scale_q = llround((1.0 / sqrt((double)BF_HEAD_DIM)) * BF_QS);
+    int64_t best = cap / (cols * (int64_t)BF_VALUE_LIMIT);
+    int64_t lim = bf_isqrt64(cap / BF_DIM);
+    if (lim < best) best = lim;
+    lim = bf_isqrt64(cap / ((int64_t)BF_HEAD_DIM * attn_scale_q));
+    if (lim < best) best = lim;
+    lim = cap / ((int64_t)BF_CTX * qs);
+    if (lim < best) best = lim;
+    lim = cap / qs;
+    if (lim < best) best = lim;
+    return best;
+}
+
 static void emit_int_tensor(FILE *f, const char *name, const int *values, int n) {
+    /* WTE is both a weight and the first activation: it is copied straight into
+       the residual stream, so it answers to the tighter of the two bounds. */
+    int64_t bound = BF_VALUE_LIMIT;
+    int64_t act = bf_activation_limit();
+    if (!strcmp(name, "WTE") && act < bound) bound = act;
+    for (int i = 0; i < n; ++i)
+        if (values[i] > bound || values[i] < -bound) {
+            fprintf(stderr, "bashformer-train: %s[%d] = %d exceeds the runtime contract "
+                            "(limit %" PRId64 "); this checkpoint would not load\n",
+                    name, i, values[i], bound);
+            exit(1);
+        }
     fprintf(f, "T %s %d\n", name, n);
     for (int i = 0; i < n; i += 24) {
         fputc('D', f);
