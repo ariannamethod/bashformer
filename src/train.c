@@ -14,7 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/types.h>
 
 #ifndef BF_VOCAB
 #define BF_VOCAB 96
@@ -214,6 +216,29 @@ static int forward(Model *m, const int *tokens, const int *targets, int want_log
     int logits = nt_seq_linear(wte, hf, BF_CTX); /* tied lm_head */
     if (want_logits) return logits;
     return nt_seq_cross_entropy(logits, tgt_i, BF_CTX, BF_VOCAB);
+}
+
+/* --out names a path prefix whose directory may not exist. Create it before the
+   run starts: a checkpoint that fails after ten thousand steps costs the whole
+   run, and the failure used to say only "final save failed". */
+static void ensure_parent_dir(const char *path) {
+    char buf[4096];
+    size_t n = strlen(path);
+    if (n == 0 || n >= sizeof buf) return;
+    memcpy(buf, path, n + 1);
+    char *slash = strrchr(buf, '/');
+    if (!slash || slash == buf) return;
+    *slash = '\0';
+    for (char *p = buf + 1; *p; ++p) {
+        if (*p != '/') continue;
+        *p = '\0';
+        mkdir(buf, 0755);
+        *p = '/';
+    }
+    if (mkdir(buf, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "bashformer-train: cannot create %s: %s\n", buf, strerror(errno));
+        exit(1);
+    }
 }
 
 static int save_model(Model *m, const char *path) {
@@ -459,6 +484,7 @@ int main(int argc, char **argv) {
     if (o.steps <= 0) die("--steps must be positive");
     if (!(o.lr > 0.0f) || !isfinite(o.lr)) die("--lr must be finite and positive");
     if (!o.out_prefix || !*o.out_prefix) die("--out must not be empty");
+    ensure_parent_dir(o.out_prefix);
     nt_seed(42);
     srand(42);
     Model *m = model_new();
@@ -531,7 +557,10 @@ int main(int argc, char **argv) {
 
     float val = eval_loss(m, data, train_end, n);
     printf("final val %.4f; nans %d\n", val, guard.total_nan_count);
-    if (save_model(m, bin_path) != 0) die("final save failed");
+    if (save_model(m, bin_path) != 0) {
+        fprintf(stderr, "bashformer-train: final save failed: %s\n", bin_path);
+        exit(1);
+    }
     export_bfw(m, bfw_path);
     FILE *mf = fopen(meta_path, "w");
     if (mf) { fprintf(mf, "%d\n%.9g\n", o.steps, best); fclose(mf); }
