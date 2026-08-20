@@ -5,15 +5,11 @@
 > notorch asks whether you need PyTorch.  
 > bashformer asks whether you need C at inference time.
 
-**Bashformer** is a decoder-only Transformer trained by
-[notorch](https://github.com/ariannamethod/notorch) and executed by GNU Bash.
-The runtime performs embeddings, RMSNorm, GQA, RoPE, causal softmax, SwiGLU,
-residual connections, the tied language-model head, and autoregressive decoding
-with Bash integer arithmetic and indexed arrays. An optional Arianna Method field can
-modulate logits, sampling temperature, and now a persistent Hebbian co-occurrence memory
+**Bashformer** is a decoder-only Transformer trained by [notorch](https://github.com/ariannamethod/notorch) and executed by GNU Bash.
+The runtime performs embeddings, RMSNorm, GQA, RoPE, causal softmax, SwiGLU, residual connections, the tied language-model head, and autoregressive decoding with Bash integer arithmetic and indexed arrays. An optional Arianna Method field can modulate logits, sampling temperature, and now a persistent Hebbian co-occurrence memory
 without adding a runtime dependency.
 
-No `awk`. No `bc`. No Python. No hidden C helper. No vendored framework.
+No `awk`. No `bc`. No Python. No hidden C helper. No vendored framework. Nothing. 
 
 ## The split
 
