@@ -70,6 +70,15 @@ declare -a BF_TENSOR_NAMES=() BF_ID_TO_HEX=()
 declare -A BF_HEX_TO_ID=() BF_SEEN_TENSOR=() BF_SEEN_META=()
 BF_VOCAB_HEX=''
 BF_VALUE_LIMIT=$((1 << 26))
+# Range check for a full 24-value record as one arithmetic expansion. A loop of
+# 24 checks costs 0.910s per 20k records against 0.429s here; the file is mostly
+# full records, so the loop only runs on the short tail one.
+BF_RANGE24=''
+for _bf_i in {0..23}; do
+    BF_RANGE24+="|(vals[$_bf_i]>BF_VALUE_LIMIT)|(vals[$_bf_i]< -BF_VALUE_LIMIT)"
+done
+BF_RANGE24=${BF_RANGE24#|}
+unset _bf_i
 
 bf_parse_int() {
     local s=$1 sign=1 mag value
@@ -321,10 +330,14 @@ bf_load_weights() {
                 vals=()
                 read -r -a vals <<< "$payload"
                 local vi
-                for ((vi=0; vi<${#vals[@]}; vi++)); do
-                    (( vals[vi] >= -BF_VALUE_LIMIT && vals[vi] <= BF_VALUE_LIMIT )) || \
-                        bf_die "$current contains unsafe fixed-point value: ${vals[vi]}"
-                done
+                if (( ${#vals[@]} == 24 )); then
+                    (( BF_RANGE24 )) && bf_die "$current contains an unsafe fixed-point value"
+                else
+                    for ((vi=0; vi<${#vals[@]}; vi++)); do
+                        (( vals[vi] >= -BF_VALUE_LIMIT && vals[vi] <= BF_VALUE_LIMIT )) || \
+                            bf_die "$current contains unsafe fixed-point value: ${vals[vi]}"
+                    done
+                fi
                 local -n target=$current
                 target+=("${vals[@]}")
                 count=$((count + ${#vals[@]}))
