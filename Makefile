@@ -17,8 +17,8 @@ fixture: $(BUILD)/mkfixture $(BUILD)/mkfixture_prod $(WEIGHTS)/fixture.bfw $(WEI
 $(BUILD)/mkfixture: tools/mkfixture.c | $(BUILD)
 	$(CC) $(CFLAGS) $< -lm -o $@
 
-$(BUILD)/mkfixture_prod: tools/mkfixture_prod.c tools/mkfixture.c | $(BUILD)
-	$(CC) $(CFLAGS) tools/mkfixture_prod.c -lm -o $@
+$(BUILD)/mkfixture_prod: tools/mkfixture.c | $(BUILD)
+	$(CC) $(CFLAGS) -DBF_PRODUCTION_GEOMETRY=1 $< -lm -o $@
 
 $(WEIGHTS)/fixture.bfw: $(BUILD)/mkfixture
 	mkdir -p $(WEIGHTS)

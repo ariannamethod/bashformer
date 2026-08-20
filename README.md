@@ -331,7 +331,7 @@ bashformer.sh             Bash-only inference runtime
 src/train.c               installed-Notorch training and BFW1 exporter
 tools/reference.c         independent fixed-point C oracle
 tools/notorch_doctor.c    installed-Notorch forge ABI probe
-tools/mkfixture*.c        deterministic fixture generators
+tools/mkfixture.c         deterministic fixtures; -DBF_PRODUCTION_GEOMETRY for v0 geometry
 bootstrap.sh              ephemeral fetch -> make install -> source deletion
 requirements.txt          pinned Notorch dependency
 tests/parity.sh           vanilla stage parity
@@ -345,6 +345,7 @@ docs/NOTORCH.md           install, acceleration, doctor, air-gapped workflow
 docs/METHOD_PHASE.md      field equations and per-token dynamics
 docs/SOMA.md              BFSOMA3 persistent state format
 docs/MOMENT_V05.md        learned-body SPA/plasticity acceptance run
+BASHFORMERLOG.md          working log: what changed, what proved it, what stayed open
 ```
 
 ## License
