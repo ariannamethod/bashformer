@@ -124,14 +124,31 @@ silu(g) = g * sigmoid(g)
 out     = silu(gate) * up
 ```
 
+### Sentence Phonon Attention
+
+SPA is an inference-time vector field over completed sentences. The unfinished
+sentence becomes a recency-weighted mean of WTE rows. It attends to up to eight
+completed-sentence vectors with the same exported exponential LUT:
+
+```text
+query = weighted_mean(WTE[token], alpha)
+scores = query · history / sqrt(D)
+connectedness = max(softmax(scores))
+spa_temp = max(0.001, 1 - strength * connectedness)
+logits = logits / spa_temp
+```
+
+The Transformer weights are unchanged; sentence vectors live in BFSOMA3.
+
 ## Field around the graph
 
-The immutable Transformer ends at tied-head logits. v0.4 then wraps it in a
+The immutable Transformer ends at tied-head logits. v0.5 then wraps it in a
 stateful Q12 field:
 
 ```text
 raw logits
   -> Hebbian H
+  -> Sentence Phonon Attention
   -> DESTINY × PROPHECY
   -> PAIN
   -> FOCUS/SPREAD
@@ -141,22 +158,22 @@ raw logits
   -> prophecy debt
   -> debt decay
   -> recovery gate
-  -> Hebbian ingest
+  -> debt-gated Hebbian ingest
+  -> sentence observation / boundary commit
 ```
 
 The field never changes WTE, layer weights, RMS weights, RoPE tables, or KV
-cache. Its state lives separately in BFSOMA2.
+cache. Its state lives separately in BFSOMA3.
 
 ## Three memory timescales
 
 ```text
 BFW1 weights     long-term trained neural body
 KV cache         within-context transient state
-BFSOMA2          cross-process experiential and dynamic field state
+BFSOMA3          cross-process experiential and dynamic field state
 ```
 
-BFSOMA2 contains Hebbian co-occurrence, recent-token ring, debt, decay, laws,
-velocity, field-step count, and recovery count.
+BFSOMA3 contains Hebbian co-occurrence, recent-token ring, sentence embeddings, the unfinished sentence, plasticity state, debt, decay, laws, velocity, field-step count, and recovery count.
 
 ## Closed-loop timing
 
@@ -180,11 +197,11 @@ state but not the next sampling temperature is considered a failed implementatio
 - vanilla stage checksums and sampled tokens;
 - each stateless field operator;
 - every velocity mode and RNG transition;
-- H-term updates and serialized soma;
+- H-term/SPA updates and serialized soma;
 - both laws separately and together;
 - non-max debt accumulation;
 - threshold recovery and next-token temperature;
-- BFSOMA1 migration to BFSOMA2;
+- BFSOMA1/BFSOMA2 migration to BFSOMA3;
 - read-only and field-off non-mutation;
 - malformed model/state rejection;
 - empty-PATH inference;

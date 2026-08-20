@@ -1,4 +1,4 @@
-SHELL := /bin/bash
+SHELL := $(shell command -v bash)
 CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra -std=c11
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
@@ -35,16 +35,11 @@ $(BUILD)/reference: tools/reference.c | $(BUILD)
 
 test-syntax:
 	bash -n bashformer.sh bootstrap.sh data/fetch_dracula.sh tools/notorch_flags.sh \
-	  tests/parity.sh tests/method.sh tests/bootstrap.sh tests/forge.sh tests/stateful.sh tests/doctor.sh
+	  tests/parity.sh tests/method.sh tests/bootstrap.sh tests/forge.sh tests/stateful.sh tests/dynamics.sh tests/spa.sh tests/doctor.sh tests/run_all.sh
 	$(CC) -Itests/stub -std=c11 -Wall -Wextra -Werror -fsyntax-only src/train.c tools/notorch_doctor.c
 
 test: fixture reference test-syntax
-	bash tests/parity.sh
-	bash tests/method.sh
-	bash tests/bootstrap.sh
-	bash tests/forge.sh
-	bash tests/stateful.sh
-	bash tests/doctor.sh
+	bash tests/run_all.sh
 
 bootstrap:
 	./bootstrap.sh

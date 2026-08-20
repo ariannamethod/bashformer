@@ -1,4 +1,4 @@
-# Method field: v0.2–v0.4
+# Method field: v0.2–v0.5
 
 Bashformer keeps the Transformer body and the Method field as separate,
 measurable layers. The body produces Q12 logits. The field transforms those
@@ -14,12 +14,13 @@ For every decoded position:
 ```text
 raw Transformer logits
   1. Hebbian H-term                    optional, stateful
-  2. DESTINY × PROPHECY
-  3. PAIN
-  4. ATTEND_FOCUS / ATTEND_SPREAD
-  5. ENTROPY_FLOOR
-  6. RESONANCE_CEILING
-  7. greedy recomputation
+  2. Sentence Phonon Attention        optional, stateful
+  3. DESTINY × PROPHECY
+  4. PAIN
+  5. ATTEND_FOCUS / ATTEND_SPREAD
+  6. ENTROPY_FLOOR
+  7. RESONANCE_CEILING
+  8. greedy recomputation
 ```
 
 Sampling then uses:
@@ -31,10 +32,11 @@ base temperature × current VELOCITY
 After the token is chosen:
 
 ```text
-  8. compute and register prophecy debt
-  9. decay debt
- 10. recovery gate may force VELOCITY NOMOVE
- 11. ingest the emitted token into Hebbian memory
+  9. compute and register prophecy debt
+ 10. decay debt
+ 11. recovery gate may force VELOCITY NOMOVE
+ 12. ingest the emitted token with flat/debt-gated Hebbian plasticity
+ 13. update or commit the current sentence embedding
 ```
 
 The recovery therefore affects the **next** token. This ordering is tested
@@ -189,7 +191,7 @@ if debt > 5 and velocity != NOMOVE:
 
 The field step counter increments once per emitted token. Debt, velocity,
 field-step count, and recovery count can survive process boundaries through
-BFSOMA2.
+BFSOMA3.
 
 A trace line exposes the loop:
 
@@ -200,6 +202,42 @@ TRACE debt chosen=90 add=3415 total=23367 velocity=nomove \
 
 For Q12, `23367 / 4096 ≈ 5.70` debt. With base temperature 1.5,
 `NOMOVE` yields `0.75`, represented as 3072.
+
+## Sentence Phonon Attention
+
+For the unfinished sentence, Bash computes an exponentially weighted token-
+embedding mean. It scores that query against up to eight completed sentence
+vectors using scaled dot products and a softmax. Connectedness is the maximum
+attention probability:
+
+```text
+connectedness = max(softmax(query · history / sqrt(d_model)))
+spa_temp      = clamp(1 - strength * connectedness, 0.001, 1)
+logits        = logits / spa_temp
+```
+
+A one-sentence history yields connectedness 1; multiple histories expose a
+non-trivial distribution. The 0.001 lower bound matches the pinned Notorch SPA
+helper and prevents division by zero at maximal strength. The transformation happens after H and before
+DESTINY, so all subsequent field operators see the sentence-conditioned
+landscape.
+
+At `.`, `!`, `?`, or newline, the current sentence is committed after its logits
+have been computed. Thus the completed sentence can influence the token that
+follows it, while the next sentence begins against an updated history.
+
+## Debt-gated plasticity
+
+`--plasticity flat` preserves the original inverse-distance update. In
+`debt` mode:
+
+```text
+gain  = 1 + debt / (debt + 5)
+delta = (1 / distance) * gain
+```
+
+The gain is Q12 and lies in `[1,2)`. Since debt is registered before emitted-
+token ingest, surprising choices write stronger experiential traces.
 
 ## Hebbian H-term
 
@@ -225,11 +263,11 @@ The H-term is applied before DESTINY. Details are in `SOMA.md`.
 
 `--field off` is the hard ablation gate:
 
-- no H-term;
+- no H-term or SPA;
 - no stateless logit transformations;
 - no debt registration or decay;
 - no recovery;
-- no co-occurrence learning;
+- no co-occurrence or sentence learning;
 - no state-file write.
 
 It reproduces the exact vanilla Transformer trace.
@@ -238,7 +276,7 @@ It reproduces the exact vanilla Transformer trace.
 
 - existing H memory may influence logits;
 - saved velocity and laws may influence generation;
-- debt, counters, velocity, co-occurrence, and soma remain unchanged.
+- debt, counters, velocity, co-occurrence, sentence history, and soma remain unchanged.
 
 ## CLI examples
 

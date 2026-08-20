@@ -1,0 +1,8 @@
+build/
+weights/*.bfw
+weights/*.bin
+weights/*.meta
+data/dracula.txt
+.deps/
+
+bashformer-src.tar.gz

@@ -1,151 +1,139 @@
-# BFSOMA2 — persistent Bashformer field state
+# BFSOMA3 — persistent Bashformer field state
 
-BFSOMA2 is a strict, line-oriented, non-executable state format. It persists the
-field that surrounds the immutable BFW1 Transformer body.
+BFSOMA3 is a strict, line-oriented, non-executable state format. BFW1 contains
+the immutable trained Transformer body; BFSOMA3 contains the field that has
+lived around that body.
 
-The parser never calls `source`, `eval`, `awk`, `sed`, Python, or a C helper.
-Every record is checked with Bash builtins. Unknown records, duplicate edges,
-invalid ranges, missing metadata, data after `Z`, and shell-looking values are
-rejected.
+The runtime never `source`s or `eval`s a soma. Every record is parsed with Bash
+builtins and range-checked. Unknown records, duplicate metadata/edges, malformed
+sentence vectors, missing end markers, data after `Z`, and shell-looking values
+fail closed.
 
 ## Example
 
 ```text
-BFSOMA2
+BFSOMA3
 M VOCAB 96
 M QSHIFT 12
-M COOC_TOTAL 14
-M DEBT_Q 23367
+M COOC_TOTAL 38
+M DEBT_Q 12168
 M DEBT_DECAY_Q 4088
 M ENTROPY_FLOOR_Q 410
 M RESONANCE_CEILING_Q 3891
-M VELOCITY nomove
-M FIELD_STEPS 14
-M RECOVERIES 1
-E 52 40 4096
-E 40 52 4096
+M VELOCITY raw
+M FIELD_STEPS 5
+M RECOVERIES 0
+M PLASTICITY debt
+M PLASTICITY_UPDATES 20
+M PLASTICITY_LAST_GAIN_Q 5623
+M SPA_ENABLED 1
+M SPA_ALPHA_Q 3482
+M SPA_STRENGTH_Q 1229
+M SPA_HISTORY_MAX 8
+M SPA_HISTORY_N 1
+M SPA_SENTENCES 1
+M SPA_LAST_CONN_Q 4096
+M SPA_LAST_TEMP_Q 2867
+E 52 40 6144
 R 8 33 44 52 40 51 39 42 40
+S 0 32 120 -44 ... 73
+C 5 52 40 51 39 42
 Z
 ```
 
 ## Records
 
 ```text
-BFSOMA2                    exact header
-M VOCAB n                  model-vocabulary guard
-M QSHIFT n                 fixed-point ABI guard
-M COOC_TOTAL n             observed-token counter
-M DEBT_Q n                 prophecy debt in Q12, 0..100Q
-M DEBT_DECAY_Q n           per-token decay in Q12, 0..Q
-M ENTROPY_FLOOR_Q n        law coefficient in Q12, 0..Q
-M RESONANCE_CEILING_Q n    law coefficient in Q12, 0..Q
-M VELOCITY mode            raw|nomove|walk|run|breathe
-M FIELD_STEPS n            emitted-token field steps
-M RECOVERIES n             RUN/WALK/etc. -> NOMOVE events
-E src dst count            sparse directed Q12 co-occurrence edge
-R n ids...                 recent-token ring, at most 8 IDs
-Z                           mandatory end marker
+BFSOMA3                         exact header
+M VOCAB n                       model-vocabulary guard
+M QSHIFT n                      fixed-point ABI guard
+M COOC_TOTAL n                  observed-token count
+M DEBT_Q n                      prophecy debt, 0..100Q
+M DEBT_DECAY_Q n                per-token decay, 0..Q
+M ENTROPY_FLOOR_Q n             law coefficient, 0..Q
+M RESONANCE_CEILING_Q n         law coefficient, 0..Q
+M VELOCITY mode                 raw|nomove|walk|run|breathe
+M FIELD_STEPS n                 emitted-token field steps
+M RECOVERIES n                  forced NOMOVE events
+M PLASTICITY flat|debt          Hebbian learning law
+M PLASTICITY_UPDATES n          debt-gated update count
+M PLASTICITY_LAST_GAIN_Q n      last gain, Q..2Q
+M SPA_ENABLED 0|1               sentence field switch
+M SPA_ALPHA_Q n                 embedding recency, 0..Q
+M SPA_STRENGTH_Q n              logit sharpening, 0..Q
+M SPA_HISTORY_MAX n             retained sentences, 1..8
+M SPA_HISTORY_N n               live sentence-vector count
+M SPA_SENTENCES n               committed-sentence count
+M SPA_LAST_CONN_Q n             latest connectedness, 0..Q
+M SPA_LAST_TEMP_Q n             latest SPA temperature, 1..Q
+E src dst count                 sparse directed Q12 co-occurrence edge
+R n ids...                      recent-token ring, max 8
+S index dim values...           one Q12 sentence embedding
+C n ids...                      unfinished sentence, max CTX
+Z                                mandatory end marker
 ```
 
-Every BFSOMA2 field metadata record is mandatory. This prevents a partially
-written or hand-edited state from silently inheriting process defaults.
+All v3 metadata is mandatory. `S` records must be contiguous from index zero,
+match the model dimension, and agree with `SPA_HISTORY_N`.
 
-## What persists
+## Three persistent layers
 
-BFSOMA2 stores two kinds of memory:
+1. **Token circulation** — sparse co-occurrence edges and the eight-token ring.
+2. **Dynamic field** — debt, laws, velocity, steps, and recovery count.
+3. **Sentence resonance** — sentence embeddings, unfinished sentence,
+   connectedness/temperature telemetry, and SPA configuration.
 
-1. **Experiential memory** — sparse co-occurrence edges and recent-token ring.
-2. **Dynamic field state** — debt, decay, laws, current velocity, field steps,
-   and recovery count.
+KV cache, prompt, RNG state, and BFW1 weights remain session/model state and are
+not serialized here.
 
-The model weights, KV cache, base sampling temperature, prompt, DESTINY, PAIN,
-FOCUS/SPREAD, and RNG state are not stored. Those remain model/session inputs.
+## Sentence memory
 
-## BFSOMA1 migration
+At `.`, `!`, `?`, or newline, the completed sentence becomes an exponentially
+weighted mean of token embeddings. The newest token has weight 1; older tokens
+receive successive powers of `SPA_ALPHA`. Up to `SPA_HISTORY_MAX` vectors are
+kept; overflow drops the oldest.
 
-The loader accepts the v0.3 format:
+The unfinished sentence is preserved as token IDs so a new process can continue
+forming the same embedding rather than beginning with an artificial blank.
 
-```text
-BFSOMA1
-M VOCAB 96
-M QSHIFT 12
-M COOC_TOTAL 14
-E 52 40 4096
-R 2 52 40
-Z
-```
+## Learning and neuromodulation
 
-A v1 load receives v0.4 defaults:
-
-```text
-debt                 0
-debt_decay           0.998
-entropy_floor         0.1
-resonance_ceiling     0.95
-velocity              raw
-field_steps           0
-recoveries            0
-```
-
-The next writable save emits BFSOMA2. Migration is tested through both Bash and
-the independent C oracle, including byte-identical output.
-
-## Learning rule
-
-For each new token, symmetric edges are added to the previous five tokens:
+Flat Hebbian learning preserves the earlier law:
 
 ```text
 edge(new, previous[d]) += 1/d
 edge(previous[d], new) += 1/d
 ```
 
-The last eight tokens form the H-term context ring. Newer ring positions receive
-stronger weight:
+Debt-gated mode multiplies each increment by:
 
 ```text
-H[i] = sum_c cooc[ring[c], i] / (ring_n - c)
-H    = H / max(H)
-logits[i] += 2 * H[i]
+gain = 1 + debt / (debt + 5)       # [1, 2)
 ```
 
-Counts are Q12 and capped at `1,000,000 * Q` (4,096,000,000 for Q12). The
-state parser therefore accepts the declared count domain rather than truncating
-it to signed 32-bit. The overlay runs before DESTINY, PAIN, attention
-focus/spread, and laws.
+The emitted token first creates prophecy debt, then its co-occurrence edges are
+written. Surprise therefore modulates learning in the same causal step.
 
-## Mutation rules
+## Migration
 
-A normal `--soma FILE` session loads, applies, learns, advances dynamics, and
-writes the file after generation.
+The loader accepts BFSOMA1 and BFSOMA2. Missing v3 state receives neutral
+values:
 
-Read/apply without mutation:
-
-```bash
-./bashformer.sh --weights weights/bashformer.bfw \
-  --prompt 'Mina ' --tokens 32 \
-  --soma mina.soma --learn off
+```text
+plasticity        flat
+SPA               off
+SPA alpha         0.85
+SPA strength      0.30
+SPA history       empty
+unfinished        empty
 ```
 
-Hard ablation:
+The next writable save emits BFSOMA3. Bash and the independent C oracle must
+serialize byte-identical migration output.
 
-```bash
-./bashformer.sh --weights weights/bashformer.bfw \
-  --prompt 'Mina ' --tokens 32 \
-  --soma mina.soma --field off
-```
+## Mutation gates
 
-Both modes leave the file byte-identical. `--field off` additionally prevents
-all field effects on generation.
-
-## Failure behavior
-
-BFSOMA2 fails closed on, among other things:
-
-- wrong `VOCAB` or `QSHIFT`;
-- duplicate headers, metadata, rings, or edges;
-- negative/out-of-range debt, laws, IDs, counts, or counters;
-- missing required field state;
-- unknown velocity;
-- missing `Z`;
-- any non-comment data after `Z`;
-- values such as `$(command)` or other shell-looking payloads.
+`--learn off` may read and apply existing H/SPA memory but leaves the file
+byte-identical. `--field off` additionally disables all overlays and all state
+mutation. A run with an empty `PATH` still parses and applies BFSOMA3 because the
+production path uses Bash builtins only.
