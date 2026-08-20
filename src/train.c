@@ -16,18 +16,36 @@
 #include <string.h>
 #include <sys/time.h>
 
+#ifndef BF_VOCAB
 #define BF_VOCAB 96
-#define BF_DIM 32
-#define BF_LAYERS 2
-#define BF_QHEADS 4
-#define BF_KVHEADS 1
+#endif
+#ifndef BF_DIM
+#define BF_DIM 256
+#endif
+#ifndef BF_LAYERS
+#define BF_LAYERS 12
+#endif
+#ifndef BF_QHEADS
+#define BF_QHEADS 8
+#endif
+#ifndef BF_KVHEADS
+#define BF_KVHEADS 2
+#endif
 #define BF_HEAD_DIM (BF_DIM / BF_QHEADS)
 #define BF_KV_DIM (BF_KVHEADS * BF_HEAD_DIM)
-#define BF_FFN 64
-#define BF_CTX 64
+#ifndef BF_FFN
+#define BF_FFN 768
+#endif
+#ifndef BF_CTX
+#define BF_CTX 256
+#endif
+#ifndef BF_QSHIFT
 #define BF_QSHIFT 12
+#endif
 #define BF_QS (1 << BF_QSHIFT)
+#ifndef BF_LUT_STEPS
 #define BF_LUT_STEPS 64
+#endif
 #define BF_ROPE_THETA 500000.0
 #define BF_EVAL_SEQS 32
 #define BF_LOG_EVERY 100
