@@ -124,6 +124,32 @@ silu(g) = g * sigmoid(g)
 out     = silu(gate) * up
 ```
 
+### The integer contract
+
+Weights are bounded at load time by `BF_VALUE_LIMIT` = 2^26. Activations are
+not: they leave `bf_matvec` and grow through the residual stream, and every
+reduction downstream multiplies two of them. `bf_activation_limit` derives, from
+the metadata alone, the largest activation magnitude under which no stage can
+leave signed 64-bit:
+
+```text
+matvec        cols * BF_VALUE_LIMIT * A   < 2^62
+rmsnorm       DIM * A^2                   < 2^62
+scores        HEAD_DIM * A^2 * ATTN_SCALE_Q < 2^62
+value mix     CTX * QS * A                < 2^62
+rope, swiglu  QS * A                      < 2^62
+```
+
+The tightest of those is `BF_ACT_LIMIT`; for the v0 geometry it is 19952650,
+against a measured peak activation of 4148. `bf_check_act` verifies every stage
+output against it and dies loudly on a breach. The C oracle derives and enforces
+the same bound in `activation_limit` and `check_act`.
+
+This is not decoration. A model whose weights sit exactly at `BF_VALUE_LIMIT`
+passes metadata validation, drives activations to 2^45, and makes the attention
+score sum wrap to exactly zero. Bash wraps silently, C is undefined, and both
+engines agree on the same garbage - so parity alone can never catch it.
+
 ### Sentence Phonon Attention
 
 SPA is an inference-time vector field over completed sentences. The unfinished

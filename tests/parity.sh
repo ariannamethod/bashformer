@@ -56,4 +56,38 @@ if "$B" --weights "$TMP/duplicate-meta.bfw" --prompt A --next-id >/dev/null 2>&1
     exit 1
 fi
 
+# A value can clear the load-time bound and still blow the 64-bit budget once it
+# is an activation: matvec squares it against the weights and attention squares
+# it again. Both engines must refuse such a model, and refuse it the same way -
+# if only one guards, parity is comparing a runtime against a broken oracle.
+in_wte=0
+touched=0
+while IFS= read -r line; do
+    if (( in_wte )) && [[ $line == D* ]]; then
+        read -r _ values <<< "$line"
+        out=D
+        for _v in $values; do out+=" 67108864"; done
+        printf '%s\n' "$out"
+        touched=1
+        continue
+    fi
+    [[ $line == "T WTE"* ]] && in_wte=1
+    [[ $line == E ]] && in_wte=0
+    printf '%s\n' "$line"
+done < "$WP" > "$TMP/overflow.bfw"
+(( touched )) || { printf 'could not build the overflow fixture\n' >&2; exit 1; }
+
+if "$B" --weights "$TMP/overflow.bfw" --prompt A --next-id >/dev/null 2>"$TMP/ovf.b"; then
+    printf 'bash executed a model that overflows the integer contract\n' >&2
+    exit 1
+fi
+if "$C" --weights "$TMP/overflow.bfw" --prompt A --next-id >/dev/null 2>"$TMP/ovf.c"; then
+    printf 'the C oracle executed a model that overflows the integer contract\n' >&2
+    exit 1
+fi
+b_msg=$(<"$TMP/ovf.b")
+c_msg=$(<"$TMP/ovf.c")
+[[ $b_msg == *"exceeds the 64-bit fixed-point contract"* ]]
+[[ ${b_msg#bashformer: } == ${c_msg#reference: } ]]
+
 printf 'parity: exact stage checksums and greedy tokens agree (%d small prompts + production geometry); parser guards pass\n' "${#prompts[@]}"

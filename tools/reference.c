@@ -11,6 +11,9 @@
 #include <string.h>
 
 #define LINE_CAP 262144
+/* Same load-time bound bashformer.sh enforces. The oracle has to refuse what
+   the runtime refuses, or parity compares two different contracts. */
+#define VALUE_LIMIT 67108864
 
 typedef struct { int *v; int n; } Tensor;
 typedef struct {
@@ -148,6 +151,7 @@ static Model load_model(const char *path) {
                 if (!*p) break;
                 errno = 0; long v = strtol(p, &end, 10);
                 if (errno || end == p || at >= current->n) die("bad tensor data");
+                if (v > VALUE_LIMIT || v < -VALUE_LIMIT) die("unsafe fixed-point value");
                 current->v[at++] = (int)v; p = end;
             }
             continue;
@@ -865,28 +869,70 @@ static int pick_next(const Runtime *r, const Model *m, int temp_q, uint32_t *rng
     return result;
 }
 
+/* Largest activation magnitude that keeps every reduction inside signed 64-bit.
+   Weights are bounded at load time, activations are not: they come out of matvec
+   and grow through the residual stream. Mirrors bf_activation_limit in
+   bashformer.sh - both engines must refuse the same models, otherwise parity
+   just compares two identically broken paths. */
+static int64_t activation_limit(const Model *m) {
+    int64_t cap = (int64_t)1 << 62, qs = (int64_t)1 << m->qshift;
+    int64_t cols = m->dim > m->ffn ? m->dim : m->ffn;
+    int64_t best = cap / (cols * VALUE_LIMIT);
+    int64_t lim = isqrt64(cap / m->dim);
+    if (lim < best) best = lim;
+    lim = isqrt64(cap / ((int64_t)m->head_dim * m->attn_scale_q));
+    if (lim < best) best = lim;
+    lim = cap / ((int64_t)m->ctx * qs);
+    if (lim < best) best = lim;
+    lim = cap / qs;
+    if (lim < best) best = lim;
+    if (best <= 0) die("model geometry leaves no room for 64-bit fixed point");
+    return best;
+}
+
+static void check_act(const char *stage, const int *a, int n, int64_t limit) {
+    for (int i = 0; i < n; ++i)
+        if (a[i] > limit || a[i] < -limit) {
+            fprintf(stderr, "reference: %s: activation %d exceeds the 64-bit "
+                            "fixed-point contract (limit %" PRId64 ")\n",
+                    stage, a[i], limit);
+            exit(1);
+        }
+}
+
 static void decode(int token, int pos, const Model *m, Runtime *r,
                    MethodField *field, int trace) {
     int kvdim = m->kvheads * m->head_dim;
     int qs = 1 << m->qshift, qhalf = qs >> 1, sigmax = 16 * m->lut_steps;
+    int64_t alim = activation_limit(m);
     if (token < 0 || token >= m->vocab) token = m->unk_id;
     memcpy(r->h, m->wte.v + token * m->dim, (size_t)m->dim * sizeof(int));
+    check_act("embedding", r->h, m->dim, alim);
     for (int l = 0; l < m->layers; ++l) {
         Layer *x = &m->layer[l];
         rmsnorm(r->xn, r->h, x->rms1.v, m->dim, m->eps_q2);
+        check_act("rmsnorm1", r->xn, m->dim, alim);
         matvec(r->q, x->wq.v, m->dim, m->dim, r->xn, m->qshift);
         matvec(r->k, x->wk.v, kvdim, m->dim, r->xn, m->qshift);
         matvec(r->v, x->wv.v, kvdim, m->dim, r->xn, m->qshift);
         rope(r->q, m->qheads, pos, m);
         rope(r->k, m->kvheads, pos, m);
+        check_act("q", r->q, m->dim, alim);
+        check_act("k", r->k, kvdim, alim);
+        check_act("v", r->v, kvdim, alim);
         memcpy(r->kcache[l] + pos * kvdim, r->k, (size_t)kvdim * sizeof(int));
         memcpy(r->vcache[l] + pos * kvdim, r->v, (size_t)kvdim * sizeof(int));
         attention(r->attn, r->q, l, pos, m, r);
+        check_act("attention", r->attn, m->dim, alim);
         matvec(r->proj, x->wo.v, m->dim, m->dim, r->attn, m->qshift);
         for (int i = 0; i < m->dim; ++i) r->h[i] += r->proj[i];
+        check_act("residual1", r->h, m->dim, alim);
         rmsnorm(r->xn, r->h, x->rms2.v, m->dim, m->eps_q2);
+        check_act("rmsnorm2", r->xn, m->dim, alim);
         matvec(r->gate, x->wg.v, m->ffn, m->dim, r->xn, m->qshift);
         matvec(r->up, x->wu.v, m->ffn, m->dim, r->xn, m->qshift);
+        check_act("gate", r->gate, m->ffn, alim);
+        check_act("up", r->up, m->ffn, alim);
         for (int i = 0; i < m->ffn; ++i) {
             int idx = ((r->gate[i] + 8 * qs) * m->lut_steps + qhalf) >> m->qshift;
             if (idx < 0) idx = 0;
@@ -894,8 +940,10 @@ static void decode(int token, int pos, const Model *m, Runtime *r,
             int silu = qshift((int64_t)r->gate[i] * m->sigmoid.v[idx], m->qshift);
             r->act[i] = qshift((int64_t)silu * r->up[i], m->qshift);
         }
+        check_act("swiglu", r->act, m->ffn, alim);
         matvec(r->down, x->wd.v, m->dim, m->ffn, r->act, m->qshift);
         for (int i = 0; i < m->dim; ++i) r->h[i] += r->down[i];
+        check_act("residual2", r->h, m->dim, alim);
         if (trace) {
             fprintf(stderr, "TRACE p=%d l=%d h=%" PRId64 " q=%" PRId64
                             " k=%" PRId64 " a=%" PRId64 "\n",
@@ -904,6 +952,7 @@ static void decode(int token, int pos, const Model *m, Runtime *r,
         }
     }
     rmsnorm(r->hf, r->h, m->rmsf.v, m->dim, m->eps_q2);
+    check_act("final rmsnorm", r->hf, m->dim, alim);
     matvec(r->logits, m->tie_head ? m->wte.v : m->head.v,
            m->vocab, m->dim, r->hf, m->qshift);
     if (trace && field && field->enabled)

@@ -173,6 +173,44 @@ bf_validate_metadata() {
     ROPE_PAIRS=$((HEAD_DIM / 2))
     EXP_MAX_INDEX=$((16 * LUT_STEPS))
     SIG_MAX_INDEX=$((16 * LUT_STEPS))
+    bf_activation_limit
+}
+
+# Largest activation magnitude that keeps every reduction inside signed 64-bit.
+# Weights are bounded at load time, activations are not: they are produced by
+# matvec and grow through the residual stream. Each stage below is the widest
+# product it forms; 2^62 leaves a bit of headroom over the int64 range.
+bf_activation_limit() {
+    local cap=$((1 << 62)) cols=$DIM best lim
+    (( FFN > cols )) && cols=$FFN
+    best=$((cap / (cols * BF_VALUE_LIMIT)))                   # matvec: cols * w * x
+    bf_isqrt $((cap / DIM)); lim=$REPLY                       # rmsnorm: n * x^2
+    (( lim < best )) && best=$lim
+    bf_isqrt $((cap / (HEAD_DIM * ATTN_SCALE_Q))); lim=$REPLY # scores: head_dim * q*k * scale
+    (( lim < best )) && best=$lim
+    lim=$((cap / (CTX * QS)))                                 # value mix: ctx * exp * v
+    (( lim < best )) && best=$lim
+    lim=$((cap / QS))                                         # rope, swiglu: x * q-constant
+    (( lim < best )) && best=$lim
+    (( best > 0 )) || bf_die "model geometry leaves no room for 64-bit fixed point"
+    BF_ACT_LIMIT=$best
+}
+
+# Fail loud when a stage produces a value the integer contract cannot carry.
+# Without this the overflow is silent: Bash wraps, C is undefined, and both
+# engines agree on the same garbage, so parity never notices.
+bf_check_act() {
+    local stage=$1
+    local -n a=$2
+    local i v
+    for ((i=0; i<${#a[@]}; i++)); do
+        v=${a[i]}
+        (( v <= BF_ACT_LIMIT && v >= -BF_ACT_LIMIT )) || {
+            unset -n a
+            bf_die "$stage: activation $v exceeds the 64-bit fixed-point contract (limit $BF_ACT_LIMIT)"
+        }
+    done
+    unset -n a
 }
 
 bf_validate_model() {
@@ -1270,25 +1308,37 @@ bf_decode_token() {
 
     BF_H=(); base=$((token * DIM))
     for ((i=0; i<DIM; i++)); do BF_H[i]=${WTE[base+i]}; done
+    bf_check_act embedding BF_H
 
     for ((l=0; l<LAYERS; l++)); do
         bf_rmsnorm BF_XN BF_H "L${l}_RMS1" "$DIM"
+        bf_check_act "L${l} rmsnorm1" BF_XN
         bf_matvec BF_Q "L${l}_WQ" "$DIM" "$DIM" BF_XN
         bf_matvec BF_K "L${l}_WK" "$KV_DIM" "$DIM" BF_XN
         bf_matvec BF_VV "L${l}_WV" "$KV_DIM" "$DIM" BF_XN
         bf_rope_inplace BF_Q "$QHEADS" "$pos"
         bf_rope_inplace BF_K "$KVHEADS" "$pos"
+        bf_check_act "L${l} q" BF_Q
+        bf_check_act "L${l} k" BF_K
+        bf_check_act "L${l} v" BF_VV
         bf_store_kv "$l" "$pos" BF_K BF_VV
         bf_attention BF_ATTN BF_Q "$l" "$pos"
+        bf_check_act "L${l} attention" BF_ATTN
         bf_matvec BF_PROJ "L${l}_WO" "$DIM" "$DIM" BF_ATTN
         for ((i=0; i<DIM; i++)); do (( BF_H[i] += BF_PROJ[i] )); done
+        bf_check_act "L${l} residual1" BF_H
 
         bf_rmsnorm BF_XN BF_H "L${l}_RMS2" "$DIM"
+        bf_check_act "L${l} rmsnorm2" BF_XN
         bf_matvec BF_GATE "L${l}_WG" "$FFN" "$DIM" BF_XN
         bf_matvec BF_UP "L${l}_WU" "$FFN" "$DIM" BF_XN
+        bf_check_act "L${l} gate" BF_GATE
+        bf_check_act "L${l} up" BF_UP
         bf_swiglu BF_ACT BF_GATE BF_UP "$FFN"
+        bf_check_act "L${l} swiglu" BF_ACT
         bf_matvec BF_DOWN "L${l}_WD" "$DIM" "$FFN" BF_ACT
         for ((i=0; i<DIM; i++)); do (( BF_H[i] += BF_DOWN[i] )); done
+        bf_check_act "L${l} residual2" BF_H
 
         if (( BF_TRACE )); then
             bf_checksum BF_H; hsum=$REPLY
@@ -1301,6 +1351,7 @@ bf_decode_token() {
     done
 
     bf_rmsnorm BF_HF BF_H RMSF "$DIM"
+    bf_check_act "final rmsnorm" BF_HF
     if (( TIE_HEAD )); then bf_matvec BF_LOGITS WTE "$VOCAB" "$DIM" BF_HF
     else bf_matvec BF_LOGITS HEAD "$VOCAB" "$DIM" BF_HF
     fi
