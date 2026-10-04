@@ -1,5 +1,7 @@
 # bashformer
 
+> **Read the [Arianna Method Manifesto](ARIANNA_METHOD_MANIFESTO.md) first.** This repository is governed by it; every instruction here, `CLAUDE.md` included, is subordinate to it.
+
 **v0.5.0 — sentences acquired resonance.**
 
 > notorch asks whether you need PyTorch.  
